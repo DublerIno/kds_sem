@@ -25,6 +25,9 @@
 #define PAYLOAD_MAX (PACKET_MAX - DATA_HDR)
 
 
+// Control message StopandWait
+static int send_control_sw( int s, const struct sockaddr_in *target_addr, uint32_t ctrl_id, const char *msg);
+
 //return the size of the file in bytes
 static uint32_t get_fsize(FILE* f){
     fseek(f, 0, SEEK_END);
@@ -114,25 +117,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    //--COMUNICATION SEQUENCE: NAME, SIZE, HASH, START,DATA packets, STOP--
+    //--COMUNICATION SEQUENCE: INFO packet ( NAME, SIZE, HASH ), START, DATA packets, STOP --
     char line[512];
     uint8_t hash[SHA256_DIGEST_LENGTH];
     char hash_hex[65];
 
-
-
-    // NAME=filename
-    snprintf(line, sizeof(line), "NAME=%s", basename_simple(path));
-    if (send_text(s, &target_addr, line) < 0) {
-        fprintf(stderr, "sendto(NAME) failed: %s\n", strerror(errno));
-        goto out;
-    }
-    // SIZE=<bytes>
-    snprintf(line, sizeof(line), "SIZE=%u", (unsigned)fsize);
-    if (send_text(s, &target_addr, line) < 0) {
-        fprintf(stderr, "sendto(SIZE) failed: %s\n", strerror(errno));
-        goto out;
-    }
 
     //COMPUTE FILE HASH 
     if (compute_sha256_file(path, hash) < 0) {
@@ -141,19 +130,24 @@ int main(int argc, char** argv) {
     }
     sha256_to_hex(hash, hash_hex);
 
-    //SEND HASH
-    snprintf(line, sizeof(line), "HASH=%s", hash_hex);
-    if (send_text(s, &target_addr, line) < 0) {
-        fprintf(stderr, "sendto(HASH) failed: %s\n", strerror(errno));
-        goto out;
+
+    // Send INFO packet = 
+    // DATA Packet:
+    //   [0..3]   "info"
+    //   [8..11]  crc32(payload) (uint32_t, network order)
+    //   [12..]   name, size, hash strings separated by \n
+
+    if (send_info_sw(s, &target_addr, path, fsize, hash_hex) < 0) {
+        fprintf(stderr, "Failed to send INFO packet\n");
+        close(s);
+        fclose(f);
+        return 1;
     }
+    printf("Sent INFO packet (name, size, hash)\n");
+        
 
     // START
-    if (sendto(s, "START", 5, 0, (const struct sockaddr*)&target_addr, (socklen_t)sizeof(target_addr)) < 0) {
-        fprintf(stderr, "sendto(START) failed: %s\n", strerror(errno));
-        goto out;
-    }
-
+    send_control_sw(s, &target_addr, ACK_START, "START");
 
     // DATA Packet:
     //   [0..3]   "DATA"
@@ -167,7 +161,6 @@ int main(int argc, char** argv) {
     //pkt + DATA_HDR == &pkt[12] - start of payload
 
     uint32_t off = 0;
-
     // Stop-and-wait loop: send one DATA packet, wait for ACK/NACK, retransmit if needed
     while (off < fsize) {
         size_t payload_len = PAYLOAD_MAX;
@@ -226,7 +219,7 @@ int main(int argc, char** argv) {
 
             uint32_t ack_off = 0;
 
-            // ACK: move forward
+            // ACK: wait for ACK and correct offset
             if (sscanf(reply, "ACK %u", &ack_off) == 1 && ack_off == off) {
                 off += (uint32_t)payload_len;
                 break;
@@ -240,13 +233,172 @@ int main(int argc, char** argv) {
     }
 
     // STOP 
-    if (sendto(s, "STOP", 4, 0, (const struct sockaddr*)&target_addr, (socklen_t)sizeof(target_addr)) < 0) {
-        fprintf(stderr, "sendto(STOP) failed: %s\n", strerror(errno));
-        goto out;
-    }
+    send_control_sw(s, &target_addr, ACK_START, "STOP");
 
 out:
     close(s);
     fclose(f);
     return 0;
+}
+
+
+
+static int send_control_sw(
+    int s,
+    const struct sockaddr_in *target_addr,
+    uint32_t ctrl_id,
+    const char *msg
+) {
+    for (;;) {
+        if (sendto(s, msg, (int)strlen(msg), 0,
+                   (const struct sockaddr*)target_addr, (socklen_t)sizeof(*target_addr)) < 0) {
+            fprintf(stderr, "sendto(%s) failed: %s\n", msg, strerror(errno));
+            return -1;
+        }
+
+        char reply[128];
+        struct sockaddr_in peer;
+        socklen_t peerlen = (socklen_t)sizeof(peer);
+
+        int n = (int)recvfrom(s, reply, (int)sizeof(reply) - 1, 0,
+                              (struct sockaddr*)&peer, &peerlen);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // timeout -> retransmit same control message
+                continue;
+            }
+            fprintf(stderr, "recvfrom() failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        reply[n] = '\0';
+
+        uint32_t ack_id = 0;
+        if (sscanf(reply, "ACK %u", &ack_id) == 1 && ack_id == ctrl_id) {
+            return 0; // success
+        }
+        if (sscanf(reply, "NACK %u", &ack_id) == 1 && ack_id == ctrl_id) {
+            continue; // resend
+        }
+
+        // ignore unrelated ACKs (e.g., delayed DATA ACK)
+    }
+}
+
+static int send_info_sw(
+    int s,
+    const struct sockaddr_in *target_addr,
+    const char *file_path,
+    uint32_t fsize,
+    const char *hash_hex   // 64 hex chars for SHA-256, NUL-terminated
+) {
+    char line[512];
+
+    uint8_t info_pkt[PACKET_MAX];
+    uint8_t *p = info_pkt;
+
+    // "INFO"
+    memcpy(p, "INFO", 4);
+    p += 4;
+
+    // ID (network order)
+    uint32_t net_id = htonl(INFO_ID);
+    memcpy(p, &net_id, 4);
+    p += 4;
+
+    // Reserve CRC space (fill later)
+    uint8_t *crc_ptr = p;
+    p += 4;
+
+    // Build payload: NAME, SIZE, HASH (newline-separated)
+    snprintf(line, sizeof(line), "NAME=%s", basename_simple(file_path));
+    size_t name_len = strlen(line);
+    if ((size_t)(p - info_pkt) + name_len + 1 > PACKET_MAX) {
+        fprintf(stderr, "INFO payload too large (NAME)\n");
+        return -1;
+    }
+    memcpy(p, line, name_len);
+    p += name_len;
+    *p++ = '\n';
+
+    snprintf(line, sizeof(line), "SIZE=%u", (unsigned)fsize);
+    size_t size_len = strlen(line);
+    if ((size_t)(p - info_pkt) + size_len + 1 > PACKET_MAX) {
+        fprintf(stderr, "INFO payload too large (SIZE)\n");
+        return -1;
+    }
+    memcpy(p, line, size_len);
+    p += size_len;
+    *p++ = '\n';
+
+    snprintf(line, sizeof(line), "HASH=%s", hash_hex);
+    size_t hash_len = strlen(line);
+    if ((size_t)(p - info_pkt) + hash_len + 1 > PACKET_MAX) {
+        fprintf(stderr, "INFO payload too large (HASH)\n");
+        return -1;
+    }
+    memcpy(p, line, hash_len);
+    p += hash_len;
+    *p++ = '\n';
+
+    // Compute payload length (bytes after INFO_HDR)
+    size_t payload_len = (size_t)(p - info_pkt - INFO_HDR);
+
+    // CRC over payload only
+    uint32_t crc = crc32(info_pkt + INFO_HDR, payload_len);
+    uint32_t net_crc = htonl(crc);
+    memcpy(crc_ptr, &net_crc, 4);
+
+    // Total packet length
+    size_t pkt_len = INFO_HDR + payload_len;
+
+    // Stop-and-Wait retransmission loop
+    for (;;) {
+        ssize_t sent = sendto(
+            s,
+            info_pkt,
+            pkt_len,
+            0,
+            (const struct sockaddr *)target_addr,
+            (socklen_t)sizeof(*target_addr)
+        );
+        if (sent < 0) {
+            fprintf(stderr, "sendto(INFO) failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        char reply[128];
+        struct sockaddr_in peer;
+        socklen_t peerlen = (socklen_t)sizeof(peer);
+
+        int n = (int)recvfrom(
+            s,
+            reply,
+            (int)sizeof(reply) - 1,
+            0,
+            (struct sockaddr *)&peer,
+            &peerlen
+        );
+        if (n < 0) {
+            // Timeout -> retransmit INFO
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            fprintf(stderr, "recvfrom(INFO) failed: %s\n", strerror(errno));
+            return -1;
+        }
+
+        reply[n] = '\0';
+
+        uint32_t ack_id = 0;
+        if (sscanf(reply, "ACK %u", &ack_id) == 1 && ack_id == INFO_ID) {
+            return 0; // success
+        }
+
+        if (sscanf(reply, "NACK %u", &ack_id) == 1 && ack_id == INFO_ID) {
+            continue; // resend
+        }
+
+        // Ignore unrelated replies (e.g., delayed ACK for data)
+    }
 }

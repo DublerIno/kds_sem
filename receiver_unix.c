@@ -17,6 +17,10 @@
 #define PACKET_MAX 1024
 #define DATA_HDR   12
 
+#define INFO_ID  0u   // fixed ID for INFO packet
+#define ACK_START 1u // Control message StartandWait ID for START/STOP
+
+
 static int send_reply(int s, const struct sockaddr_in *to, const char *msg) {
     ssize_t n = sendto(
         s, msg, strlen(msg), 0,
@@ -24,6 +28,20 @@ static int send_reply(int s, const struct sockaddr_in *to, const char *msg) {
     );
     return (n < 0) ? -1 : 0;
 }
+static int send_reply_ctrl(int s, const struct sockaddr_in *to, uint32_t ctrl_id) {
+    char reply[64];
+    snprintf(reply, sizeof(reply), "ACK %u", ctrl_id);
+    return send_reply(s, to, reply);
+}
+
+static void parse_info_payload(
+    const char *payload,
+    size_t payload_len,
+    char *out_filename,
+    size_t out_filename_cap,
+    uint32_t *out_expected_size,
+    char out_expected_hash_hex[65]
+);
 
 int main(int argc, char **argv) {
     if (argc != 4) {
@@ -70,6 +88,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    //INFO 
     char filename[256] = "received.bin";
     uint32_t expected_size = 0;
     char expected_hash_hex[65] = {0}; // 64 hex 
@@ -81,7 +100,8 @@ int main(int argc, char **argv) {
 
     struct sockaddr_in peer;
     socklen_t peerlen;
-
+    
+    
     for (;;) {
         peerlen = (socklen_t)sizeof(peer);
         int n = (int)recvfrom(s, buf, (size_t)PACKET_MAX, 0, (struct sockaddr *)&peer, &peerlen);
@@ -90,21 +110,23 @@ int main(int argc, char **argv) {
             continue;
         }
 
+        int handled = receive_info_and_reply(
+        s, buf, (size_t)n, &ack_addr,
+        filename, sizeof(filename),
+        &expected_size, expected_hash_hex
+        );
+        if (handled != 0) {
+            if (handled < 0) break; // fatal
+            continue;               // INFO handled (ACK/NACK sent)
+        }
+
         // Check for control message
         if (n < DATA_HDR || memcmp(buf, "DATA", 4) != 0) {
             char txt[PACKET_MAX + 1];
             memcpy(txt, buf, (size_t)n);
             txt[n] = '\0';
 
-            if (!strncmp(txt, "NAME=", 5)) {
-                strncpy(filename, txt + 5, sizeof(filename) - 1);
-                filename[sizeof(filename) - 1] = '\0';
-            } else if (!strncmp(txt, "SIZE=", 5)) {
-                expected_size = (uint32_t)strtoul(txt + 5, NULL, 10);
-            } else if (!strncmp(txt, "HASH=", 5)) {
-                strncpy(expected_hash_hex, txt + 5, sizeof(expected_hash_hex) - 1);
-                expected_hash_hex[sizeof(expected_hash_hex) - 1] = '\0';
-            } else if (!strcmp(txt, "START")) {
+            if (!strcmp(txt, "START")) {
                 out = fopen(filename, "wb+");
                 if (!out) {
                     fprintf(stderr, "fopen('%s') failed: %s\n", filename, strerror(errno));
@@ -112,8 +134,10 @@ int main(int argc, char **argv) {
                 }
                 expected_off = 0;
                 printf("Receiving %s (%u bytes)\n", filename, (unsigned)expected_size);
+                send_reply_ctrl(s, &ack_addr, ACK_START);
             } else if (!strcmp(txt, "STOP")) {
                 printf("STOP\n");
+                send_reply_ctrl(s, &ack_addr, ACK_START);
                 break;
             }
 
@@ -196,6 +220,8 @@ int main(int argc, char **argv) {
         printf("ACK %u\n", off);
     }
 
+    
+
     // Close output file to flush buffers before hashing
     if (out) {
         fflush(out);
@@ -225,4 +251,88 @@ int main(int argc, char **argv) {
 
     close(s);
     return 0;
+}
+
+
+static void parse_info_payload(
+    const char *payload,
+    size_t payload_len,
+    char *out_filename,
+    size_t out_filename_cap,
+    uint32_t *out_expected_size,
+    char out_expected_hash_hex[65]
+) {
+    // Copy to a temporary NUL-terminated buffer for safe string operations
+    char tmp[PACKET_MAX + 1];
+    if (payload_len > PACKET_MAX) payload_len = PACKET_MAX;
+    memcpy(tmp, payload, payload_len);
+    tmp[payload_len] = '\0';
+
+    // Parse line-by-line
+    char *save = NULL;
+    for (char *line = strtok_r(tmp, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (!strncmp(line, "NAME=", 5)) {
+            strncpy(out_filename, line + 5, out_filename_cap - 1);
+            out_filename[out_filename_cap - 1] = '\0';
+        } else if (!strncmp(line, "SIZE=", 5)) {
+            *out_expected_size = (uint32_t)strtoul(line + 5, NULL, 10);
+        } else if (!strncmp(line, "HASH=", 5)) {
+            strncpy(out_expected_hash_hex, line + 5, 64);
+            out_expected_hash_hex[64] = '\0';
+        }
+    }
+}
+
+static int receive_info_and_reply(
+    int s,
+    const uint8_t *buf,
+    size_t nbytes,
+    const struct sockaddr_in *ack_addr,
+    char *out_filename,
+    size_t out_filename_cap,
+    uint32_t *out_expected_size,
+    char out_expected_hash_hex[65]
+) {
+    if (nbytes < INFO_HDR) return 0;
+    if (memcmp(buf, "INFO", 4) != 0) return 0;
+
+    // Extract id and crc
+    uint32_t net_id = 0, net_crc = 0;
+    memcpy(&net_id,  buf + 4, 4);
+    memcpy(&net_crc, buf + 8, 4);
+
+    uint32_t id = ntohl(net_id);
+    uint32_t recv_crc = ntohl(net_crc);
+
+    size_t payload_len = nbytes - INFO_HDR;
+    const uint8_t *payload = buf + INFO_HDR;
+
+    // Validate CRC over payload only
+    uint32_t calc_crc = crc32(payload, payload_len);
+
+    char reply[64];
+
+    if (calc_crc != recv_crc) {
+        snprintf(reply, sizeof(reply), "NACK %u", id);
+        if (sendto(s, reply, strlen(reply), 0,
+                   (const struct sockaddr *)ack_addr, (socklen_t)sizeof(*ack_addr)) < 0) {
+            fprintf(stderr, "sendto(NACK INFO) failed: %s\n", strerror(errno));
+            return -1;
+        }
+        return 1;
+    }
+
+    // CRC OK -> parse payload and ACK
+    parse_info_payload((const char *)payload, payload_len,
+                       out_filename, out_filename_cap,
+                       out_expected_size, out_expected_hash_hex);
+
+    snprintf(reply, sizeof(reply), "ACK %u", id);
+    if (sendto(s, reply, strlen(reply), 0,
+               (const struct sockaddr *)ack_addr, (socklen_t)sizeof(*ack_addr)) < 0) {
+        fprintf(stderr, "sendto(ACK INFO) failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    return 1;
 }

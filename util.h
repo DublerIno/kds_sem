@@ -8,6 +8,11 @@
 #include <stdint.h>
 #include <openssl/sha.h>
 
+//info packet
+#define INFO_HDR 12
+#define INFO_ID  0u   // fixed ID for INFO packet
+#define ACK_START 1u // Control message StartandWait ID for START/STOP
+
 
 
 void crc32_init(void);
