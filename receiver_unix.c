@@ -262,26 +262,45 @@ static void parse_info_payload(
     uint32_t *out_expected_size,
     char out_expected_hash_hex[65]
 ) {
-    // Copy to a temporary NUL-terminated buffer for safe string operations
-    char tmp[PACKET_MAX + 1];
-    if (payload_len > PACKET_MAX) payload_len = PACKET_MAX;
-    memcpy(tmp, payload, payload_len);
-    tmp[payload_len] = '\0';
+    size_t i = 0;
 
-    // Parse line-by-line
-    char *save = NULL;
-    for (char *line = strtok_r(tmp, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        if (!strncmp(line, "NAME=", 5)) {
-            strncpy(out_filename, line + 5, out_filename_cap - 1);
-            out_filename[out_filename_cap - 1] = '\0';
-        } else if (!strncmp(line, "SIZE=", 5)) {
-            *out_expected_size = (uint32_t)strtoul(line + 5, NULL, 10);
-        } else if (!strncmp(line, "HASH=", 5)) {
-            strncpy(out_expected_hash_hex, line + 5, 64);
-            out_expected_hash_hex[64] = '\0';
+    while (i < payload_len) {
+        // find end of line
+        size_t line_start = i;
+        while (i < payload_len && payload[i] != '\n') {
+            i++;
+        }
+        size_t line_len = i - line_start;
+
+        // process one line
+        if (line_len >= 5 && !memcmp(payload + line_start, "NAME=", 5)) {
+            size_t len = line_len - 5;
+            if (len >= out_filename_cap) len = out_filename_cap - 1;
+            memcpy(out_filename, payload + line_start + 5, len);
+            out_filename[len] = '\0';
+        }
+        else if (line_len >= 5 && !memcmp(payload + line_start, "SIZE=", 5)) {
+            char tmp[32];
+            size_t len = line_len - 5;
+            if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+            memcpy(tmp, payload + line_start + 5, len);
+            tmp[len] = '\0';
+            *out_expected_size = (uint32_t)strtoul(tmp, NULL, 10);
+        }
+        else if (line_len >= 5 && !memcmp(payload + line_start, "HASH=", 5)) {
+            size_t len = line_len - 5;
+            if (len > 64) len = 64;
+            memcpy(out_expected_hash_hex, payload + line_start + 5, len);
+            out_expected_hash_hex[len] = '\0';
+        }
+
+        // skip '\n'
+        if (i < payload_len && payload[i] == '\n') {
+            i++;
         }
     }
 }
+
 
 static int receive_info_and_reply(
     int s,
