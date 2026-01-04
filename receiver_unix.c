@@ -43,6 +43,18 @@ static void parse_info_payload(
     char out_expected_hash_hex[65]
 );
 
+
+static int receive_info_and_reply(
+    int s,
+    const uint8_t *buf,
+    size_t nbytes,
+    const struct sockaddr_in *ack_addr,
+    char *out_filename,
+    size_t out_filename_cap,
+    uint32_t *out_expected_size,
+    char out_expected_hash_hex[65]
+);
+
 int main(int argc, char **argv) {
     if (argc != 4) {
         fprintf(stderr, "Usage: %s <listen_data_port> <derper_ip> <derper_ack_port>\n", argv[0]);
